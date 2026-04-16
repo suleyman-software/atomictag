@@ -7,7 +7,9 @@
       "Bash(taskkill //F //IM node.exe)",
       "mcp__Claude_Preview__preview_start",
       "Bash(tasklist //FI \"IMAGENAME eq node.exe\" //FO CSV)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "mcp__a1b82c06-f40b-46ba-8f01-1b3584ba7d3f__deploy_to_vercel",
+      "Bash(npx vercel:*)"
     ]
   }
 }

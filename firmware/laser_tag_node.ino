@@ -4,12 +4,31 @@
  * HTTP Polling: WSS yerine HTTPS REST API kullanır (daha stabil)
  * LCD: I2C 16x2 ekran desteği
  *
- * Pinler:
- *   D1 (GPIO5)  → Tetik butonu
- *   D2 (GPIO4)  → Lazer LED
- *   D5 (GPIO14) → Buzzer
- *   A0          → LDR sensör
- *   D6 (GPIO12) → EEPROM sıfırlama butonu (opsiyonel)
+ * ── Bağlantı Şeması ──────────────────────────────────────────
+ *  I2C LCD
+ *    SDA          → D2  (GPIO4)
+ *    SCL          → D1  (GPIO5)
+ *    VCC          → VIN
+ *    GND          → GND
+ *
+ *  KY-008 Lazer Modülü
+ *    S (Sinyal)   → D5  (GPIO14)
+ *    Orta (+)     → 3V3
+ *    - (GND)      → GND
+ *
+ *  Tetik Butonu
+ *    Bacak 1      → D6  (GPIO12)
+ *    Bacak 2      → GND
+ *
+ *  Buzzer
+ *    + (uzun)     → D7  (GPIO13)
+ *    - (kısa)     → GND
+ *
+ *  Göğüs Sensörü
+ *    LDR Bacak 1  → 3V3
+ *    LDR Bacak 2  → A0
+ *    10K Direnç   → A0 ile GND arası
+ * ────────────────────────────────────────────────────────────
  */
 
 #include <ESP8266WiFi.h>
@@ -21,14 +40,13 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-#define SERVER_HOST "web-production-2a0c4.up.railway.app"
-#define SERVER_URL  "https://web-production-2a0c4.up.railway.app"
+#define SERVER_HOST "atomictag.vercel.app"
+#define SERVER_URL  "https://atomictag.vercel.app"
 
-#define PIN_TRIGGER  5
-#define PIN_LASER    4
-#define PIN_BUZZER   14
-#define PIN_LDR      A0
-#define PIN_RESET_CFG 12
+#define PIN_TRIGGER   12   // D6
+#define PIN_LASER     14   // D5
+#define PIN_BUZZER    13   // D7
+#define PIN_LDR       A0
 
 #define MAX_AMMO         30
 #define MAX_HP           100
@@ -378,21 +396,11 @@ void setup() {
   pinMode(PIN_TRIGGER, INPUT_PULLUP);
   pinMode(PIN_LASER, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_RESET_CFG, INPUT_PULLUP);
   digitalWrite(PIN_LASER, LOW);
 
   lcd.init();
   lcd.backlight();
   lcdShow("AtomicTag v4", "Baslatiliyor...");
-
-  // D6 basılıysa EEPROM'u sıfırla
-  if (digitalRead(PIN_RESET_CFG) == LOW) {
-    Serial.println("[!] Reset pin LOW — clearing config");
-    lcdShow("EEPROM", "SIFIRLANIYOR...");
-    clearConfig();
-    delay(1000);
-    ESP.restart();
-  }
 
   loadConfig();
 

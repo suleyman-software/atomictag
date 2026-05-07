@@ -51,6 +51,8 @@ const httpServer = createServer((req, res) => {
 
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
+  pingInterval: 60000,
+  pingTimeout: 30000,
 });
 
 // ── Oyun State ───────────────────────────────────────────────

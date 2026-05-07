@@ -254,8 +254,7 @@ void handleFire() {
   lastFireTime = millis();
 
   digitalWrite(PIN_LASER, HIGH);
-  buzzerTone(2000, FIRE_DURATION_MS);
-  delay(FIRE_DURATION_MS);
+  buzzerTone(2000, 50);
   digitalWrite(PIN_LASER, LOW);
 
   ammo--;
@@ -300,7 +299,7 @@ void parseMessage(const char* payload) {
 
   if (strcmp(ev, "game:start") == 0) {
     gameActive = true; ammo = MAX_AMMO; hp = MAX_HP;
-    buzzerTone(1000, 200); delay(250); buzzerTone(1500, 200);
+    buzzerTone(1500, 150);
     Serial.println("[GAME] Start");
     lcdGameStatus();
   }
@@ -432,7 +431,6 @@ void setup() {
   ws.beginSSL(SERVER_HOST, SERVER_PORT, "/socket.io/?EIO=4&transport=websocket");
   ws.onEvent(wsEvent);
   ws.setReconnectInterval(5000);
-  ws.enableHeartbeat(25000, 5000, 2);
 
   Serial.println("[OK] Ready!");
 }
@@ -453,13 +451,21 @@ void loop() {
 
   handleLDR();
 
-  // WiFi kopma kontrolü
+  // WiFi kopma kontrolü — 30 saniye aralıkla, sadece gerçekten koptuysa
   static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 10000) {
+  static int wifiFailCount = 0;
+  if (millis() - lastCheck > 30000) {
     lastCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Reconnecting...");
+      wifiFailCount++;
+      Serial.printf("[WiFi] Not connected (attempt %d)\n", wifiFailCount);
+      if (wifiFailCount >= 3) {
+        Serial.println("[WiFi] Restarting...");
+        ESP.restart();
+      }
       WiFi.reconnect();
+    } else {
+      wifiFailCount = 0;
     }
   }
 }

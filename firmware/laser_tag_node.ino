@@ -1,7 +1,7 @@
 /*
- * AtomicTag — NodeMCU (ESP8266) Laser Tag Firmware v3
+ * AtomicTag — NodeMCU (ESP8266) Laser Tag Firmware v4
  *
- * Production: WSS ile Railway sunucusuna bağlanır
+ * HTTP Polling: WSS yerine HTTPS REST API kullanır (daha stabil)
  * LCD: I2C 16x2 ekran desteği
  *
  * Pinler:
@@ -14,20 +14,21 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
 #include <EEPROM.h>
-#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
 #define SERVER_HOST "web-production-2a0c4.up.railway.app"
-#define SERVER_PORT 443
+#define SERVER_URL  "https://web-production-2a0c4.up.railway.app"
 
 #define PIN_TRIGGER  5
 #define PIN_LASER    4
 #define PIN_BUZZER   14
 #define PIN_LDR      A0
-#define PIN_RESET_CFG 12  // D6 — açılışta basılıysa EEPROM sıfırlar
+#define PIN_RESET_CFG 12
 
 #define MAX_AMMO         30
 #define MAX_HP           100
@@ -36,9 +37,10 @@
 #define DEBOUNCE_MS      200
 #define FIRE_DURATION_MS 80
 #define HIT_COOLDOWN_MS  500
+#define POLL_INTERVAL_MS 600
 
 #define EEPROM_SIZE 512
-#define CFG_MAGIC   0x4155  // "AU" — yeni versiyon magic
+#define CFG_MAGIC   0x4156  // "AV" — v4 magic
 
 struct DeviceConfig {
   uint16_t magic;
@@ -51,16 +53,19 @@ DeviceConfig config;
 bool configValid = false;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-WebSocketsClient ws;
 ESP8266WebServer portalServer(80);
 
 int  ammo       = MAX_AMMO;
 int  hp         = MAX_HP;
 bool gameActive = false;
-bool wsConnected = false;
+bool serverConnected = false;
 bool apMode      = false;
 unsigned long lastFireTime = 0;
 unsigned long lastHitTime  = 0;
+unsigned long lastPollTime = 0;
+
+// SSL istemci — insecure mode (sertifika doğrulaması atlanır, ESP8266 için gerekli)
+BearSSL::WiFiClientSecure secureClient;
 
 // ── LCD ─────────────────────────────────────────────────────
 
@@ -91,7 +96,7 @@ void loadConfig() {
     configValid = false;
     memset(&config, 0, sizeof(config));
     strlcpy(config.playerId, "player1", 32);
-    Serial.println("[CFG] No config");
+    Serial.println("[CFG] No config — defaults");
   }
 }
 
@@ -118,17 +123,81 @@ void buzzerTone(int freq, int dur) {
   tone(PIN_BUZZER, freq, dur);
 }
 
-// ── Socket.IO mesaj gönderme ────────────────────────────────
+// ── HTTP Helpers ────────────────────────────────────────────
 
-void sendEvent(const char* event, JsonDocument& payload) {
-  String msg = "42[\"";
-  msg += event;
-  msg += "\",";
-  String j;
-  serializeJson(payload, j);
-  msg += j;
-  msg += "]";
-  ws.sendTXT(msg);
+int httpGET(const char* path, String& response) {
+  HTTPClient http;
+  http.setTimeout(3000);
+  http.begin(secureClient, String(SERVER_URL) + path);
+  int code = http.GET();
+  if (code == 200) {
+    response = http.getString();
+  }
+  http.end();
+  return code;
+}
+
+int httpPOST(const char* path, const String& body) {
+  HTTPClient http;
+  http.setTimeout(3000);
+  http.begin(secureClient, String(SERVER_URL) + path);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  http.end();
+  return code;
+}
+
+// ── Server Poll ─────────────────────────────────────────────
+
+void pollServer() {
+  String url = "/api/device/poll?playerId=";
+  url += config.playerId;
+
+  String response;
+  int code = httpGET(url.c_str(), response);
+
+  if (code == 200) {
+    if (!serverConnected) {
+      serverConnected = true;
+      Serial.println("[HTTP] Server connected!");
+      buzzerTone(1500, 100);
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, response)) return;
+
+    bool wasActive = gameActive;
+    gameActive = doc["active"] | false;
+    hp   = doc["hp"]   | hp;
+    ammo = doc["ammo"] | ammo;
+
+    const char* cmd = doc["cmd"];
+    if (cmd) {
+      if (strcmp(cmd, "start") == 0) {
+        gameActive = true;
+        ammo = MAX_AMMO;
+        hp = MAX_HP;
+        buzzerTone(1500, 150);
+        Serial.println("[GAME] Start!");
+      }
+      else if (strcmp(cmd, "stop") == 0) {
+        gameActive = false;
+        buzzerTone(300, 500);
+        Serial.println("[GAME] Stop!");
+        lcdShow("OYUN BITTI", "");
+        return;
+      }
+    }
+
+    lcdGameStatus();
+
+  } else {
+    if (serverConnected) {
+      serverConnected = false;
+      Serial.printf("[HTTP] Poll failed: %d\n", code);
+      lcdShow("Sunucu baglanti", "bekleniyor...");
+    }
+  }
 }
 
 // ── Captive Portal ──────────────────────────────────────────
@@ -258,11 +327,16 @@ void handleFire() {
   digitalWrite(PIN_LASER, LOW);
 
   ammo--;
-  JsonDocument doc;
-  doc["playerId"] = config.playerId;
-  doc["ammo"]     = ammo;
-  sendEvent("fire", doc);
   lcdGameStatus();
+
+  // HTTP POST fire event
+  String body = "{\"playerId\":\"";
+  body += config.playerId;
+  body += "\",\"ammo\":";
+  body += ammo;
+  body += "}";
+  int code = httpPOST("/api/device/fire", body);
+  Serial.printf("[FIRE] ammo:%d http:%d\n", ammo, code);
 }
 
 // ── Vuruş ───────────────────────────────────────────────────
@@ -275,11 +349,17 @@ void handleLDR() {
     lastHitTime = millis();
     hp = max(0, hp - HIT_DAMAGE);
     buzzerTone(500, 300);
-    JsonDocument doc;
-    doc["playerId"] = config.playerId;
-    doc["hp"]       = hp;
-    sendEvent("hit", doc);
     lcdGameStatus();
+
+    // HTTP POST hit event
+    String body = "{\"playerId\":\"";
+    body += config.playerId;
+    body += "\",\"hp\":";
+    body += hp;
+    body += "}";
+    int code = httpPOST("/api/device/hit", body);
+    Serial.printf("[HIT] hp:%d http:%d\n", hp, code);
+
     if (hp <= 0) {
       gameActive = false;
       buzzerTone(150, 1000);
@@ -288,107 +368,12 @@ void handleLDR() {
   }
 }
 
-// ── Socket.IO mesaj parse ───────────────────────────────────
-
-void parseMessage(const char* payload) {
-  if (payload[0] != '4' || payload[1] != '2') return;
-  JsonDocument doc;
-  if (deserializeJson(doc, payload + 2)) return;
-  const char* ev = doc[0];
-  if (!ev) return;
-
-  if (strcmp(ev, "game:start") == 0) {
-    gameActive = true; ammo = MAX_AMMO; hp = MAX_HP;
-    buzzerTone(1500, 150);
-    Serial.println("[GAME] Start");
-    lcdGameStatus();
-  }
-  else if (strcmp(ev, "game:stop") == 0) {
-    gameActive = false;
-    buzzerTone(300, 500);
-    Serial.println("[GAME] Stop");
-    lcdShow("OYUN BITTI", "");
-  }
-  else if (strcmp(ev, "game:state") == 0) {
-    if (doc[1].containsKey("ammo")) ammo = doc[1]["ammo"];
-    if (doc[1].containsKey("hp"))   hp   = doc[1]["hp"];
-  }
-  else if (strcmp(ev, "config:update") == 0) {
-    JsonObject cfg = doc[1];
-    if (cfg.containsKey("ssid"))     strlcpy(config.wifiSsid, cfg["ssid"], 64);
-    if (cfg.containsKey("password")) strlcpy(config.wifiPassword, cfg["password"], 64);
-    if (cfg.containsKey("playerId")) strlcpy(config.playerId, cfg["playerId"], 32);
-    saveConfig();
-    lcdShow("Ayar guncellendi", "Yeniden basl...");
-    delay(1000);
-    ESP.restart();
-  }
-}
-
-// ── WebSocket event handler ─────────────────────────────────
-
-void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      wsConnected = false;
-      Serial.printf("[WS] DISC heap:%d\n", ESP.getFreeHeap());
-      lcdShow("Sunucu baglanti", "bekleniyor...");
-      break;
-
-    case WStype_CONNECTED:
-      Serial.printf("[WS] TCP connected heap:%d\n", ESP.getFreeHeap());
-      // Socket.IO transport açıldı, handshake bekleniyor
-      break;
-
-    case WStype_TEXT: {
-      String text = String((char*)payload);
-      Serial.printf("[WS] RX: %.60s\n", (char*)payload);
-
-      // Socket.IO OPEN paketi — sunucu sid gönderir
-      if (text.startsWith("0{")) {
-        // Socket.IO namespace'e bağlan
-        ws.sendTXT("40");
-        Serial.println("[SIO] Sent CONNECT (40)");
-      }
-      // Socket.IO CONNECT ACK — namespace bağlantısı tamam
-      else if (text.startsWith("40")) {
-        wsConnected = true;
-        Serial.println("[SIO] Connected to namespace!");
-        // Cihazı kaydet
-        JsonDocument doc;
-        doc["playerId"] = config.playerId;
-        doc["type"]     = "device";
-        sendEvent("register", doc);
-        Serial.println("[SIO] Registered as device");
-        lcdGameStatus();
-        buzzerTone(1500, 100);
-      }
-      // Socket.IO EVENT
-      else if (text.startsWith("42")) {
-        parseMessage((char*)payload);
-      }
-      // Socket.IO PING
-      else if (text == "2") {
-        ws.sendTXT("3");
-      }
-      break;
-    }
-
-    case WStype_ERROR:
-      Serial.printf("[WS] ERROR heap:%d\n", ESP.getFreeHeap());
-      break;
-
-    default:
-      break;
-  }
-}
-
 // ── Setup ───────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n\n=== AtomicTag v3 ===");
+  Serial.println("\n\n=== AtomicTag v4 (HTTP) ===");
 
   pinMode(PIN_TRIGGER, INPUT_PULLUP);
   pinMode(PIN_LASER, OUTPUT);
@@ -398,7 +383,7 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
-  lcdShow("AtomicTag v3", "Baslatiliyor...");
+  lcdShow("AtomicTag v4", "Baslatiliyor...");
 
   // D6 basılıysa EEPROM'u sıfırla
   if (digitalRead(PIN_RESET_CFG) == LOW) {
@@ -425,14 +410,12 @@ void setup() {
   }
   lcdShow("WiFi OK!", "Sunucuya bagl...");
 
-  // WSS bağlantısı — Railway production
-  Serial.printf("[WS] -> %s:%d (SSL)\n", SERVER_HOST, SERVER_PORT);
-  Serial.printf("[WS] Heap: %d\n", ESP.getFreeHeap());
-  ws.beginSSL(SERVER_HOST, SERVER_PORT, "/socket.io/?EIO=4&transport=websocket");
-  ws.onEvent(wsEvent);
-  ws.setReconnectInterval(5000);
+  // SSL sertifika doğrulamasını atla (ESP8266 için gerekli)
+  secureClient.setInsecure();
 
-  Serial.println("[OK] Ready!");
+  Serial.printf("[HTTP] Server: %s\n", SERVER_URL);
+  Serial.printf("[HTTP] Heap: %d\n", ESP.getFreeHeap());
+  Serial.println("[OK] Ready — polling mode");
 }
 
 // ── Loop ────────────────────────────────────────────────────
@@ -443,15 +426,21 @@ void loop() {
     return;
   }
 
-  ws.loop();
-
+  // Tetik kontrolü
   if (digitalRead(PIN_TRIGGER) == LOW) {
     handleFire();
   }
 
+  // LDR vuruş kontrolü
   handleLDR();
 
-  // WiFi kopma kontrolü — 30 saniye aralıkla, sadece gerçekten koptuysa
+  // Server poll (her POLL_INTERVAL_MS ms)
+  if (millis() - lastPollTime >= POLL_INTERVAL_MS) {
+    lastPollTime = millis();
+    pollServer();
+  }
+
+  // WiFi kopma kontrolü
   static unsigned long lastCheck = 0;
   static int wifiFailCount = 0;
   if (millis() - lastCheck > 30000) {

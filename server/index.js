@@ -29,12 +29,39 @@ function getLocalIP() {
 
 const LOCAL_IP = getLocalIP();
 
-const httpServer = createServer((req, res) => {
-  // CORS headers
-  res.setHeader("Access-Control-Allow-Origin", "*");
+// ESP8266 cihazlar için bekleyen komutlar (poll ile alınır)
+const pendingCommands = { player1: null, player2: null };
 
-  // Dashboard IP bilgisi — telefon bu endpoint'ten sunucu IP'sini öğrenir
-  if (req.url === "/api/info") {
+// ESP8266 cihaz bağlantı takibi (son poll zamanı)
+const deviceLastSeen = { player1: 0, player2: 0 };
+
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      try { resolve(JSON.parse(body)); }
+      catch { resolve({}); }
+    });
+  });
+}
+
+const httpServer = createServer(async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
+
+  // Dashboard IP bilgisi
+  if (path === "/api/info") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       serverIP: LOCAL_IP,
@@ -42,6 +69,77 @@ const httpServer = createServer((req, res) => {
       frontendPort: FRONTEND_PORT,
       dashboardURL: `http://${LOCAL_IP}:${FRONTEND_PORT}`,
     }));
+    return;
+  }
+
+  // ── ESP8266 REST API ──────────────────────────────────────
+
+  // Device poll — ESP8266 her 500ms bunu çağırır
+  if (path === "/api/device/poll" && req.method === "GET") {
+    const playerId = url.searchParams.get("playerId");
+    if (!playerId || !gameState.players[playerId]) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid playerId" }));
+      return;
+    }
+
+    // Cihazı "online" olarak işaretle
+    deviceLastSeen[playerId] = Date.now();
+    if (!gameState.players[playerId].deviceSocketId) {
+      gameState.players[playerId].deviceSocketId = "http-" + playerId;
+      console.log(`[HTTP] ${playerId} connected via polling`);
+      broadcastState();
+    }
+
+    const cmd = pendingCommands[playerId];
+    pendingCommands[playerId] = null;
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      active: gameState.active,
+      hp: gameState.players[playerId].hp,
+      ammo: gameState.players[playerId].ammo,
+      cmd: cmd,
+    }));
+    return;
+  }
+
+  // Device fire
+  if (path === "/api/device/fire" && req.method === "POST") {
+    const data = await parseBody(req);
+    const { playerId, ammo } = data;
+    if (!playerId || !gameState.players[playerId]) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid" }));
+      return;
+    }
+    if (gameState.active) {
+      gameState.players[playerId].ammo = ammo;
+      console.log(`[HTTP Fire] ${playerId} — ammo: ${ammo}`);
+      broadcastState();
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // Device hit
+  if (path === "/api/device/hit" && req.method === "POST") {
+    const data = await parseBody(req);
+    const { playerId, hp } = data;
+    if (!playerId || !gameState.players[playerId]) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid" }));
+      return;
+    }
+    if (gameState.active) {
+      gameState.players[playerId].hp = hp;
+      console.log(`[HTTP Hit] ${playerId} — hp: ${hp}`);
+      broadcastState();
+      if (hp <= 0) endGame("elimination");
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
 
@@ -121,6 +219,8 @@ function endGame(reason = "time") {
   };
 
   io.emit("game:stop");
+  pendingCommands.player1 = "stop";
+  pendingCommands.player2 = "stop";
   broadcastState();
   io.to("dashboard").emit("game:end", result);
 
@@ -205,8 +305,10 @@ io.on("connection", (socket) => {
     gameState.players.player2.hp = DEFAULT_HP;
     gameState.players.player2.ammo = DEFAULT_AMMO;
 
-    // Cihazlara başlat komutu
+    // Cihazlara başlat komutu (Socket.IO + HTTP polling)
     io.to("devices").emit("game:start");
+    pendingCommands.player1 = "start";
+    pendingCommands.player2 = "start";
     broadcastState();
 
     // Süre sayacı
@@ -258,6 +360,8 @@ io.on("connection", (socket) => {
     if (gameTimer) clearTimeout(gameTimer);
     gameState = createFreshState();
     io.to("devices").emit("game:stop");
+    pendingCommands.player1 = "stop";
+    pendingCommands.player2 = "stop";
     broadcastState();
     console.log("[Admin] Game reset");
   });
@@ -276,6 +380,19 @@ io.on("connection", (socket) => {
     console.log(`[Socket] Disconnected: ${socket.id}`);
   });
 });
+
+// HTTP cihazları offline kontrolü (5 saniye poll yoksa offline)
+setInterval(() => {
+  const now = Date.now();
+  for (const pid of ["player1", "player2"]) {
+    const sid = gameState.players[pid].deviceSocketId;
+    if (sid && sid.startsWith("http-") && now - deviceLastSeen[pid] > 5000) {
+      gameState.players[pid].deviceSocketId = null;
+      console.log(`[HTTP] ${pid} timed out`);
+      broadcastState();
+    }
+  }
+}, 3000);
 
 // ── Sunucu Başlat ────────────────────────────────────────────
 

@@ -13,15 +13,17 @@ export default function DeviceSettings({
   const [p1Config, setP1Config] = useState({
     ssid: "",
     password: "",
-    host: "",
-    port: "3001",
+    host: "web-production-2a0c4.up.railway.app",
+    port: "443",
+    ssl: true,
   });
 
   const [p2Config, setP2Config] = useState({
     ssid: "",
     password: "",
-    host: "",
-    port: "3001",
+    host: "web-production-2a0c4.up.railway.app",
+    port: "443",
+    ssl: true,
   });
 
   const configs = { player1: p1Config, player2: p2Config };
@@ -39,6 +41,7 @@ export default function DeviceSettings({
       password: currentConfig.password,
       host: currentConfig.host,
       port: parseInt(currentConfig.port, 10),
+      ssl: currentConfig.ssl,
     });
   }
 
@@ -145,13 +148,13 @@ export default function DeviceSettings({
           <div className="grid grid-cols-[1fr_100px] gap-3">
             <div>
               <label className="mb-1.5 block text-xs font-medium text-gray-400">
-                Sunucu IP Adresi
+                Sunucu Adresi
               </label>
               <input
                 type="text"
                 value={currentConfig.host}
                 onChange={(e) => updateField("host", e.target.value)}
-                placeholder="192.168.1.100"
+                placeholder="web-production-2a0c4.up.railway.app"
                 className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm
                            placeholder:text-gray-600 focus:border-blue-500 focus:outline-none"
               />
@@ -169,6 +172,16 @@ export default function DeviceSettings({
               />
             </div>
           </div>
+
+          <label className="flex items-center gap-2 text-sm text-gray-400">
+            <input
+              type="checkbox"
+              checked={currentConfig.ssl}
+              onChange={(e) => updateField("ssl", e.target.checked)}
+              className="h-4 w-4 rounded border-gray-600 accent-blue-500"
+            />
+            SSL/WSS Kullan (production icin acik birakin)
+          </label>
 
           {/* Config result feedback */}
           {configResult && configResult.playerId === activeTab && (

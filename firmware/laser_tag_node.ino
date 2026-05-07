@@ -5,6 +5,7 @@
  *   - İlk açılışta Captive Portal (AP modu) ile Wi-Fi ayarları
  *   - Ayarlar EEPROM'a kaydedilir, tekrar girmeye gerek yok
  *   - Web dashboard'dan uzaktan ayar güncellemesi
+ *   - SSL/WSS desteği (Railway production sunucusu)
  *   - Tetik, lazer, buzzer, LDR tam entegrasyon
  *
  * Pinler:
@@ -19,6 +20,11 @@
 #include <EEPROM.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+
+// Production sunucu adresi
+#define DEFAULT_SERVER_HOST "web-production-2a0c4.up.railway.app"
+#define DEFAULT_SERVER_PORT 443
+#define DEFAULT_USE_SSL     true
 
 // ── Pin Tanımları ────────────────────────────────────────────
 #define PIN_TRIGGER  5   // D1
@@ -46,6 +52,7 @@ struct DeviceConfig {
   char serverHost[64];
   uint16_t serverPort;
   char playerId[32];
+  uint8_t useSSL;
 };
 
 DeviceConfig config;
@@ -73,10 +80,15 @@ void loadConfig() {
     configValid = true;
     Serial.println("[Config] Loaded from EEPROM");
     Serial.printf("  SSID: %s\n", config.wifiSsid);
-    Serial.printf("  Server: %s:%d\n", config.serverHost, config.serverPort);
+    Serial.printf("  Server: %s:%d (SSL: %s)\n", config.serverHost, config.serverPort, config.useSSL ? "yes" : "no");
     Serial.printf("  Player: %s\n", config.playerId);
   } else {
     configValid = false;
+    // Varsayılan production ayarları
+    strlcpy(config.serverHost, DEFAULT_SERVER_HOST, 64);
+    config.serverPort = DEFAULT_SERVER_PORT;
+    config.useSSL = DEFAULT_USE_SSL ? 1 : 0;
+    strlcpy(config.playerId, "player1", 32);
     Serial.println("[Config] No saved config found");
   }
 }
@@ -143,11 +155,16 @@ border-radius:8px;color:white;font-size:15px;font-weight:600;cursor:pointer}
 <label>Wi-Fi Sifresi</label>
 <input type="password" name="password" placeholder="Wi-Fi sifreniz">
 
-<label>Sunucu IP Adresi</label>
-<input type="text" name="host" placeholder="192.168.1.100" required>
+<label>Sunucu Adresi</label>
+<input type="text" name="host" value="web-production-2a0c4.up.railway.app" required>
 
 <label>Sunucu Portu</label>
-<input type="number" name="port" value="3001" required>
+<input type="number" name="port" value="443" required>
+
+<label style="margin-top:12px">
+<input type="checkbox" name="ssl" value="1" checked style="width:auto;margin-right:6px">
+SSL/WSS Kullan (production icin acik birakin)
+</label>
 
 <label>Oyuncu ID</label>
 <select name="playerid" required>
@@ -206,12 +223,14 @@ void startCaptivePortal() {
     String host = portalServer.arg("host");
     String port = portalServer.arg("port");
     String pid  = portalServer.arg("playerid");
+    String ssl  = portalServer.arg("ssl");
 
     ssid.toCharArray(config.wifiSsid, 64);
     pass.toCharArray(config.wifiPassword, 64);
     host.toCharArray(config.serverHost, 64);
     config.serverPort = port.toInt();
     pid.toCharArray(config.playerId, 32);
+    config.useSSL = (ssl == "1") ? 1 : 0;
 
     saveConfig();
     configValid = true;
@@ -232,6 +251,7 @@ void startCaptivePortal() {
     doc["host"]     = config.serverHost;
     doc["port"]     = config.serverPort;
     doc["playerId"] = config.playerId;
+    doc["ssl"]      = config.useSSL;
     String json;
     serializeJson(doc, json);
     portalServer.send(200, "application/json", json);
@@ -377,6 +397,7 @@ void parseSocketIOMessage(const char* payload) {
     if (cfg.containsKey("host"))     strlcpy(config.serverHost, cfg["host"], 64);
     if (cfg.containsKey("port"))     config.serverPort = cfg["port"];
     if (cfg.containsKey("playerId")) strlcpy(config.playerId, cfg["playerId"], 32);
+    if (cfg.containsKey("ssl"))      config.useSSL = cfg["ssl"] ? 1 : 0;
 
     saveConfig();
     Serial.println("[Config] Updated remotely, restarting...");
@@ -453,7 +474,13 @@ void setup() {
   }
 
   // WebSocket bağlantısı
-  ws.begin(config.serverHost, config.serverPort, "/socket.io/?EIO=4&transport=websocket");
+  if (config.useSSL) {
+    ws.beginSSL(config.serverHost, config.serverPort, "/socket.io/?EIO=4&transport=websocket");
+    Serial.printf("[WS] Connecting via WSS to %s:%d\n", config.serverHost, config.serverPort);
+  } else {
+    ws.begin(config.serverHost, config.serverPort, "/socket.io/?EIO=4&transport=websocket");
+    Serial.printf("[WS] Connecting via WS to %s:%d\n", config.serverHost, config.serverPort);
+  }
   ws.onEvent(wsEvent);
   ws.setReconnectInterval(3000);
 
